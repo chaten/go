@@ -789,8 +789,8 @@ func TestServeContent(t *testing.T) {
 	}
 }
 
-// verifies that sendfile is being used on Linux
-func TestLinuxSendfile(t *testing.T) {
+// verifies that splice is being used on Linux
+func TestLinuxSplice(t *testing.T) {
 	defer afterTest(t)
 	if runtime.GOOS != "linux" {
 		t.Skip("skipping; linux-only test")
@@ -810,7 +810,7 @@ func TestLinuxSendfile(t *testing.T) {
 	defer ln.Close()
 
 	var buf bytes.Buffer
-	child := exec.Command("strace", "-f", "-q", "-e", "trace=sendfile,sendfile64", os.Args[0], "-test.run=TestLinuxSendfileChild")
+	child := exec.Command("strace", "-f", "-q", "-e", "trace=splice", os.Args[0], "-test.run=TestLinuxSendfileChild")
 	child.ExtraFiles = append(child.ExtraFiles, lnf)
 	child.Env = append([]string{"GO_WANT_HELPER_PROCESS=1"}, os.Environ()...)
 	child.Stdout = &buf
@@ -832,12 +832,11 @@ func TestLinuxSendfile(t *testing.T) {
 	// Force child to exit cleanly.
 	Get(fmt.Sprintf("http://%s/quit", ln.Addr()))
 	child.Wait()
-
-	rx := regexp.MustCompile(`sendfile(64)?\(\d+,\s*\d+,\s*NULL,\s*\d+\)\s*=\s*\d+\s*\n`)
-	rxResume := regexp.MustCompile(`<\.\.\. sendfile(64)? resumed> \)\s*=\s*\d+\s*\n`)
+//splice(8, NULL, 10, NULL, 22, SPLICE_F_MORE) = 22
+	rx := regexp.MustCompile(`splice\(\d+,\s*NULL,\s*\d+,\s*NULL,\s*\d+\,\s*SPLICE_F_MORE\)\s*=\s*\d+\s*\n`)
 	out := buf.String()
-	if !rx.MatchString(out) && !rxResume.MatchString(out) {
-		t.Errorf("no sendfile system call found in:\n%s", out)
+	if !rx.MatchString(out) {
+		t.Errorf("no splice system call found in:\n%s", out)
 	}
 }
 
