@@ -11,9 +11,12 @@ import (
 
 // maxSendfileSize is the largest chunk size we ask the kernel to copy
 // at a time.
-const maxSendfileSize int = 1024 * 16
+// If this is greater than the kernel's max pipe buffer size, a deadlock can occur.
+// This is 64KB on Linux 2.6 and above
+const maxSendfileSize int = 1024 * 64
+
 //TODO: Add splice constants to syscall package?
-const splice_f_more int = 0x4
+const _SPLICE_F_MORE int = 0x4
 
 // sendFile copies the contents of r to c using the splice
 // system call to minimize copies.
@@ -32,17 +35,27 @@ func sendFile(c *netFD, r io.Reader) (written int64, err error, handled bool) {
 			return 0, nil, true
 		}
 	}
-	src, ok := fd(r)
+	src, ok := spliceableReader(r, c)
 	if !ok {
 		return 0, nil, false
 	}
+	dst := &spliceable{
+		c:      c,
+		fd:     c.sysfd,
+		lock:   c.writeLock,
+		unlock: c.writeUnlock,
+		wait:   c.pd.WaitWrite,
+	}
 
-	if err := c.writeLock(); err != nil {
+	if err := dst.lock(); err != nil {
 		return 0, err, true
 	}
-	defer c.writeUnlock()
+	defer dst.unlock()
+	if err := src.lock(); err != nil {
+		return 0, err, true
+	}
+	defer src.unlock()
 
-	dst := c.sysfd
 	rPipe, wPipe, err := os.Pipe()
 	if err != nil {
 		return 0, &OpError{"pipe", c.net, c.raddr, err}, false
@@ -51,18 +64,14 @@ func sendFile(c *netFD, r io.Reader) (written int64, err error, handled bool) {
 	defer wPipe.Close()
 	rPipeFd, wPipeFd := int(rPipe.Fd()), int(wPipe.Fd())
 	pipeLen := 0
-	readWait := readWaitFn(r)
 	for remain > 0 || pipeLen > 0 {
 		toRead := maxSendfileSize
-		spliceFlags := 0
 		if int64(toRead) >= remain {
 			toRead = int(remain)
-		} else {
-			spliceFlags |= splice_f_more
 		}
 		// if we have stuff to read and we won't overflow pipeLen by reading more
-		if pipeLen + toRead > pipeLen  {
-			n, rerr := syscall.Splice(src, nil, wPipeFd, nil, toRead, spliceFlags)
+		if pipeLen+toRead > pipeLen && pipeLen+toRead <= maxSendfileSize {
+			n, rerr := syscall.Splice(src.fd, nil, wPipeFd, nil, toRead, _SPLICE_F_MORE)
 			if n > 0 {
 				remain -= n
 				pipeLen += int(n)
@@ -70,14 +79,14 @@ func sendFile(c *netFD, r io.Reader) (written int64, err error, handled bool) {
 			if n == 0 && rerr == nil {
 				break
 			}
-			rerr = handleSpliceErr(c, readWait, rerr)
+			rerr = handleSpliceErr(src, rerr)
 			if rerr != nil {
 				err = rerr
 				break
 			}
 		}
 		if pipeLen > 0 {
-			n, werr := syscall.Splice(rPipeFd, nil, dst, nil, pipeLen, spliceFlags)
+			n, werr := syscall.Splice(rPipeFd, nil, dst.fd, nil, pipeLen, _SPLICE_F_MORE)
 			if n > 0 {
 				written += n
 				pipeLen -= int(n)
@@ -85,7 +94,7 @@ func sendFile(c *netFD, r io.Reader) (written int64, err error, handled bool) {
 			if n == 0 && werr == nil {
 				break
 			}
-			werr = handleSpliceErr(c, c.pd.WaitWrite, werr)
+			werr = handleSpliceErr(dst, werr)
 			if werr != nil {
 				err = werr
 				break
@@ -98,32 +107,47 @@ func sendFile(c *netFD, r io.Reader) (written int64, err error, handled bool) {
 	return written, err, written > 0
 }
 
-func fd(r io.Reader) (int, bool) {
+type spliceable struct {
+	//The connection any OpErrors should be associated with
+	c      *netFD
+	fd     int
+	lock   func() error
+	unlock func()
+	wait   func() error
+}
+
+func spliceableReader(r io.Reader, c *netFD) (*spliceable, bool) {
 	if f, ok := r.(*os.File); ok {
-		return int(f.Fd()), true
+		doNothing := func() error { return nil }
+		return &spliceable{
+			c:      c,
+			fd:     int(f.Fd()),
+			lock:   doNothing,
+			unlock: func() {},
+			wait:   doNothing,
+		}, true
 	}
 	if conn, ok := r.(*TCPConn); ok {
-		return conn.fd.sysfd, true
+		return &spliceable{
+			c:      conn.fd,
+			fd:     conn.fd.sysfd,
+			lock:   conn.fd.readLock,
+			unlock: conn.fd.readUnlock,
+			wait:   conn.fd.pd.WaitRead,
+		}, true
 	}
-	return 0, false
+	return nil, false
 }
 
-func readWaitFn(r io.Reader) func() error {
-	if conn, ok := r.(*TCPConn); ok {
-		return conn.fd.pd.WaitRead;
-	}
-	return func() error { return nil }
-}
-
-func handleSpliceErr(c *netFD, waitFn func() error, err error) error {
+func handleSpliceErr(s *spliceable, err error) error {
 	if err == syscall.EAGAIN {
-		err = waitFn()
+		err = s.wait()
 	}
 	if err != nil {
 		// This includes syscall.ENOSYS (no kernel
 		// support) and syscall.EINVAL (fd types which
 		// don't implement sendfile together)
-		err = &OpError{"sendfile", c.net, c.raddr, err}
+		err = &OpError{"s", s.c.net, s.c.raddr, err}
 	}
 	return err
 }
