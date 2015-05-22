@@ -832,8 +832,7 @@ func TestLinuxSplice(t *testing.T) {
 	// Force child to exit cleanly.
 	Get(fmt.Sprintf("http://%s/quit", ln.Addr()))
 	child.Wait()
-//splice(8, NULL, 10, NULL, 22, SPLICE_F_MORE) = 22
-	rx := regexp.MustCompile(`splice\(\d+,\s*NULL,\s*\d+,\s*NULL,\s*\d+\,\s*\S+\)\s*=\s*\d+\s*\n`)
+	rx := regexp.MustCompile(`splice\(\d+,\s*NULL,\s*\d+,\s*NULL,\s*\d+\,\s*\w+\)\s*=\s*\d+\s*\n`)
 	out := buf.String()
 	if !rx.MatchString(out) {
 		t.Errorf("no splice system call found in:\n%s", out)
