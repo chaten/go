@@ -54,12 +54,15 @@ func sendFile(c *netFD, r io.Reader) (written int64, err error, handled bool) {
 	pipeLen := 0
 	for remain > 0 || pipeLen > 0 {
 		toRead := maxSendfileSize
-		if int64(toRead) > remain {
+		spliceFlags := 0
+		if int64(toRead) >= remain {
 			toRead = int(remain)
+		} else {
+			spliceFlags = splice_f_more
 		}
 		// if we have stuff to read and we won't overflow pipeLen by reading more
 		if pipeLen + toRead > pipeLen {
-			n, rerr := syscall.Splice(src, nil, wPipeFd, nil, toRead, splice_f_more)
+			n, rerr := syscall.Splice(src, nil, wPipeFd, nil, toRead, spliceFlags)
 			if n > 0 {
 				remain -= n
 				pipeLen += int(n)
@@ -74,7 +77,7 @@ func sendFile(c *netFD, r io.Reader) (written int64, err error, handled bool) {
 			}
 		}
 		if pipeLen > 0 {
-			n, werr := syscall.Splice(rPipeFd, nil, dst, nil, pipeLen, splice_f_more)
+			n, werr := syscall.Splice(rPipeFd, nil, dst, nil, pipeLen, spliceFlags)
 			if n > 0 {
 				written += n
 				pipeLen -= int(n)
